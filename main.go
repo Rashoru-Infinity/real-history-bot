@@ -33,14 +33,64 @@ func GetMessageEvent(eventsAPIEvent slackevents.EventsAPIEvent) (*slackevents.Me
 	return ev, ok
 }
 
+func getBlameFromPostedMessage(payload map[string]interface{}) (string, string) {
+	urls := make([]byte, 0, 100)
+	content, ok := payload["event"].(map[string]interface{})["text"].(string)
+	if !ok {
+		log.Println("parse: event.text")
+		return "", ""
+	}
+	content += "\n"
+	files, ok := payload["event"].(map[string]interface{})["files"].([]interface{})
+	if !ok {
+		log.Println("no file")
+		goto getauthor
+	}
+	for _, f := range files {
+		url, ok := f.(map[string]interface{})["url_private"].(string)
+		if !ok {
+			log.Println("parse: event.files.url_private")
+			continue
+		}
+		urls = append(urls, url...)
+		urls = append(urls, '\n')
+	}
+	if len(urls) > 0 {
+		content += string(urls)
+	}
+getauthor:
+	author, ok := payload["event"].(map[string]interface{})["user"].(string)
+	if !ok {
+		log.Println("parse: event.user")
+		return "", ""
+	}
+	return author, content
+}
+
+func getBlameFromEditedMessage(payload map[string]interface{}) (string, string) {
+	content, ok := payload["event"].(map[string]interface{})["message"].(map[string]interface{})["text"].(string)
+	if !ok {
+		log.Println("parse: event.text")
+		return "", ""
+	}
+	content += "\n"
+	author, ok := payload["event"].(map[string]interface{})["message"].(map[string]interface{})["user"].(string)
+	if !ok {
+		log.Println("parse: event.message.user")
+		return "", ""
+	}
+	return author, content
+}
+
 func HandleMessageEvent(ev *socketmode.Event, sockClient *socketmode.Client) {
 	var (
-		payload   map[string]interface{}
-		author    string
-		channel   string
-		timestamp string
-		content   string
-		urls      = make([]byte, 0, 100)
+		payload           map[string]interface{}
+		author            string
+		channel           string
+		timestamp         string
+		content           string
+		evSubtype         string
+		contentMDTemplate string
 	)
 	eventsAPIEvent, ok := GetEvent(ev)
 	if !ok {
@@ -58,9 +108,19 @@ func HandleMessageEvent(ev *socketmode.Event, sockClient *socketmode.Client) {
 		log.Println("json.Unmarshal")
 		return
 	}
-	author, ok = payload["event"].(map[string]interface{})["user"].(string)
+	evSubtype, ok = payload["event"].(map[string]interface{})["subtype"].(string)
 	if !ok {
-		log.Println("parse: event.user")
+		author, content = getBlameFromPostedMessage(payload)
+		contentMDTemplate = "(%s) %s\n```\n%s```\n"
+	} else if evSubtype == "message_changed" {
+		author, content = getBlameFromEditedMessage(payload)
+		contentMDTemplate = "(%s) %s edited message\n```\n%s```\n"
+	} else {
+		log.Println("unsupported subtype event")
+		return
+	}
+	if len(author) == 0 {
+		log.Println("cannot get author info")
 		return
 	}
 	timestamp, ok = payload["event"].(map[string]interface{})["ts"].(string)
@@ -68,30 +128,6 @@ func HandleMessageEvent(ev *socketmode.Event, sockClient *socketmode.Client) {
 		log.Println("parse: event.ts")
 		return
 	}
-	content, ok = payload["event"].(map[string]interface{})["text"].(string)
-	if !ok {
-		log.Println("parse: event.text")
-		return
-	}
-	content += "\n"
-	files, ok := payload["event"].(map[string]interface{})["files"].([]interface{})
-	if !ok {
-		log.Println("no file")
-		goto pushrepo
-	}
-	for _, f := range files {
-		url, ok := f.(map[string]interface{})["url_private"].(string)
-		if !ok {
-			log.Println("parse: event.files.url_private")
-			continue
-		}
-		urls = append(urls, url...)
-		urls = append(urls, '\n')
-	}
-	if len(urls) > 0 {
-		content += string(urls)
-	}
-pushrepo:
 	repoURL := configMap["GIT_REPOSITORY_URL"]
 	fs := memfs.New()
 	storer := memory.NewStorage()
@@ -131,7 +167,7 @@ pushrepo:
 		log.Println("fs.OpenFile")
 		return
 	}
-	contentMDFmt := fmt.Sprintf("(%s) %s\n```\n%s```\n", timestamp, author, content)
+	contentMDFmt := fmt.Sprintf(contentMDTemplate, timestamp, author, content)
 	_, err = file.Write([]byte(contentMDFmt))
 	if err != nil {
 		log.Println("file.Write")
